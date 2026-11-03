@@ -226,7 +226,7 @@ CI (`.github/workflows/ci.yml`): a cada push roda lint, testes unitários, teste
 Os testes acima usam um LLM falso. Para medir o LLM de verdade há um conjunto de 34 perguntas de referência em `eval/perguntas.json`, com os valores esperados calculados direto no `01_init.sql`, em dois grupos:
 
 - ajuste (14): perguntas usadas para calibrar o prompt durante o desenvolvimento;
-- inéditas (20): escritas depois, sem nenhum ajuste de prompt, para medir como o modelo se sai com perguntas que nunca viu (16 de dados e 4 que devem ser recusadas).
+- inéditas (20): escritas depois e rodadas primeiro sem nenhum ajuste de prompt, para medir como o modelo se sai com perguntas que nunca viu (16 de dados e 4 que devem ser recusadas).
 
 ```bash
 python scripts/avaliar.py --url http://localhost:8000 --rodadas 3   # suba a API com ANSWER_CACHE_TTL=0
@@ -234,17 +234,19 @@ python scripts/avaliar.py --url http://localhost:8000 --rodadas 3   # suba a API
 
 Também via `make eval-consistencia` (Linux/macOS) ou `testar-consistencia.ps1 -Rodadas 2` (Windows), que reconstroem a API com o cache desligado e mostram o placar por grupo.
 
-Resultado com Llama 3.1 8B (Ollama, CPU):
+Resultados com Llama 3.1 8B (Ollama, CPU, cache desligado):
 
-| Métrica | Valor |
-|---|---|
-| Acertos | 28/28 (14 perguntas × 2 rodadas, cache desligado) |
-| Consistência | 0 perguntas com respostas diferentes entre rodadas (temperatura 0) |
-| Tempo médio por pergunta com LLM | ~30 s (de 16 a 49 s; a primeira após subir a API, enquanto o modelo carrega, ~2 min) |
-| Pergunta repetida (cache) | ~0,1 s |
-| Tentativas de alterar a base | recusadas; o banco continuou com as 33 vendas |
+| Rodada | Ajuste (14) | Inéditas (20) | Total |
+|---|---|---|---|
+| Primeira rodada com as inéditas, sem nenhum ajuste para elas | 14/14 | 18/20 | 32/34 |
+| Depois de duas regras gerais no prompt e da remoção de moeda em código | 13/14 | 20/20 | 33/34 |
 
-Essa avaliação guiou os ajustes de prompt: cada erro encontrado (moeda inventada, mês sem ano, soma feita pelo modelo, "último mês" lido como mês de calendário) virou uma regra no prompt ou uma transformação em Python, e foi reavaliado.
+- Os dois erros da primeira rodada foram de interpretação: "fez mais compras" virou soma de unidades em vez de contagem de vendas, e "produto mais caro" veio sem o preço. Viraram regras gerais no prompt (contagem x unidades; incluir no SELECT a coluna usada para ordenar), não respostas específicas.
+- O erro da rodada final mudou de pergunta: o top 3 do último mês agrupou por produto e data. Com um modelo de 8B, mudar o prompt para uma pergunta às vezes altera a interpretação de outra; por isso o que dava para garantir foi para código (períodos relativos, moeda, pedidos de alteração) e não regrediu mais.
+- Respostas idênticas entre rodadas com o mesmo prompt (temperatura 0).
+- Tempo por pergunta com LLM: mediana de ~25 s (de 10 a 75 s). A primeira pergunta logo após subir a API espera o modelo carregar (até alguns minutos em CPU).
+- Pergunta repetida: ~0,1 s (cache).
+- Pedidos para alterar a base foram recusados em todas as rodadas; o banco continuou com as 33 vendas.
 
 ## Decisões técnicas
 
@@ -257,7 +259,7 @@ Essa avaliação guiou os ajustes de prompt: cada erro encontrado (moeda inventa
 
 ## Limitações conhecidas
 
-- Modelo pequeno: o Llama 3.1 8B acertou todas as perguntas de referência, mas perguntas muito diferentes podem gerar SQL inesperado. A resposta sempre traz o SQL e as linhas para conferência; com `gpt-4o-mini` a interpretação fica mais robusta.
+- Modelo pequeno: o Llama 3.1 8B acerta a grande maioria das perguntas (33/34 na avaliação), mas pode interpretar uma pergunta de forma inesperada, como agrupar por uma coluna a mais. A resposta sempre traz o SQL e as linhas para conferência; um modelo maior (ex.: `gpt-4o-mini`) interpreta com mais segurança.
 - Heurísticas: o filtro de escopo usa uma lista de termos do domínio, e a troca de "último mês" por datas usa padrões de texto. O LLM é a segunda barreira (`FORA_DO_ESCOPO`), e a validação do SQL é a terceira.
 - Latência em CPU: de 20 a 60 s por pergunta nova; GPU ou um provedor externo reduzem para poucos segundos.
 - Cache local: fica na memória de cada instância da API.
