@@ -1,0 +1,64 @@
+# Uso: docker compose up -d
+# Sobe o Postgres (já com dados), o Ollama, baixa o modelo automaticamente (~4,7 GB na primeira vez)
+# e a API em http://localhost:8000. Acompanhe o download com: docker compose logs -f ollama-pull
+# Para usar OpenAI em vez do Ollama: veja a seção "Como rodar" do README.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sales
+      POSTGRES_PASSWORD: sales
+      POSTGRES_DB: sales
+    ports:
+      - "5432:5432"
+    volumes:
+      # Na primeira subida executa 01_init.sql (esquema + dados) e 02_readonly_user.sql
+      - ./db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sales -d sales"]
+      interval: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      retries: 20
+
+  # Baixa o modelo uma vez e termina (nas próximas subidas é instantâneo, o modelo fica no volume)
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${LLM_MODEL:-llama3.1}"]
+    restart: "no"
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      # A API conecta com o usuário somente leitura (ver db/02_readonly_user.sql)
+      DATABASE_URL: postgresql+psycopg2://sales_reader:sales_reader@db:5432/sales
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      LLM_MODEL: ${LLM_MODEL:-llama3.1}
+      OLLAMA_BASE_URL: http://ollama:11434
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      REFERENCE_DATE: ${REFERENCE_DATE:-}
+      ANSWER_CACHE_TTL: ${ANSWER_CACHE_TTL:-3600}
+    ports:
+      - "8000:8000"
+
+volumes:
+  ollama:
