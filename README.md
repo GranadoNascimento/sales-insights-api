@@ -2,7 +2,7 @@
 
 API em FastAPI que responde perguntas sobre uma base de vendas em PostgreSQL usando linguagem natural. O LLM (Llama 3.1 via Ollama por padrão, ou OpenAI) gera o SQL, a API valida e executa a consulta, e o LLM responde usando só as linhas que voltaram do banco. Toda resposta traz o SQL e as linhas usadas, para dar para conferir.
 
-Além dos endpoints pedidos, o projeto tem validação do SQL com sqlglot, usuário somente leitura no banco, 94 testes (76 unitários e 18 contra um Postgres real), CI no GitHub Actions e uma avaliação do LLM com perguntas de referência (resultados em [Avaliação do LLM](#avaliação-do-llm)).
+Além dos endpoints pedidos, o projeto tem validação do SQL com sqlglot, usuário somente leitura no banco, 94 testes (76 unitários e 18 contra um Postgres real), CI no GitHub Actions e uma avaliação do LLM com perguntas de referência. Arquitetura, segurança, decisões técnicas e limitações estão em [docs/DETALHES.md](docs/DETALHES.md).
 
 ## Início rápido
 
@@ -29,9 +29,11 @@ Atalhos: `make help` (Linux/macOS) ou `testar-docker.ps1` (Windows). Sem Docker 
 | Método | Rota | Descrição |
 |---|---|---|
 | GET | `/sales-insights?question=...` | Responde perguntas sobre vendas usando dados recuperados do banco |
-| GET | `/top-products?days=30` | Top 5 produtos mais vendidos (por quantidade) no último mês |
+| GET | `/top-products?days=30` | Top 5 produtos mais vendidos (por quantidade) no último mês: os 30 dias até a data de referência |
 | GET | `/health` | Verifica o banco e o LLM (Ollama acessível e modelo baixado) |
 | GET | `/docs` | Documentação interativa (Swagger) |
+
+Sobre "último mês" e a data de referência: os dados do script são de janeiro a março de 2025, então a API usa como "hoje" a data da última venda (2025-03-02 10:00). "Último mês" são os 30 dias até essa data (31/01 a 02/03) e "última semana" os 7 dias até ela, tanto no `/top-products` quanto no `/sales-insights`. A janela muda com `?days=` (ex.: `/top-products?days=7`) e a data com a variável `REFERENCE_DATE`.
 
 Exemplo de resposta de `/sales-insights?question=Qual foi o produto mais vendido na última semana?`:
 
@@ -55,68 +57,21 @@ Códigos de resposta do `/sales-insights`:
 | 422 | Parâmetro inválido (pergunta vazia ou longa demais) |
 | 502 | Falha do LLM ou SQL que não pôde ser corrigido; mensagem genérica, detalhe só no log |
 
-`/health` responde `200` com `status: ok`, `200` com `status: degraded` quando o LLM está fora (o `/top-products` continua funcionando) e `503` quando o banco está fora.
+## Como funciona
 
-Toda resposta traz os cabeçalhos `X-Request-ID` (enviado pelo cliente ou gerado) e `X-Process-Time`, também registrados no log.
+1. A pergunta passa por um filtro: fora do escopo de vendas, tentativa de prompt injection ou pedido para alterar a base voltam 400 sem chamar o LLM.
+2. O LLM recebe o esquema das tabelas (com linhas de exemplo) e gera um SELECT. "Última semana" e "último mês" chegam a ele já convertidos em datas.
+3. O SQL é validado com sqlglot (só leitura, só as tabelas `sales`, `products` e `customers`, com LIMIT) e executado com um usuário somente leitura, em transação `READ ONLY` e com timeout. Se der erro, o LLM recebe o erro e corrige (até 2 vezes).
+4. Sem linhas no resultado, a resposta é fixa ("não encontrei dados") e o LLM não é chamado.
+5. Com linhas, o LLM escreve a resposta usando só essas linhas.
 
-## Arquitetura
-
-```mermaid
-flowchart TD
-    Q[GET /sales-insights] --> G1{Guardrail da pergunta}
-    G1 -- fora do escopo / injection / alteração --> E400[400]
-    G1 --> C{Cache de respostas}
-    C -- acerto --> R[Resposta]
-    C --> P[Reescreve 'última semana' / 'último mês' como intervalo exato]
-    P --> L1[LLM gera SQL a partir do esquema + linhas de exemplo]
-    L1 --> G2{Guardrail do SQL - sqlglot}
-    G2 -- inseguro --> E400
-    G2 --> X[Execução: usuário somente leitura, READ ONLY, timeout]
-    X -- erro --> F[Erro volta ao LLM para corrigir, até 2 vezes] --> G2
-    X -- sem linhas --> N[Resposta fixa: não encontrei dados]
-    X -- linhas --> L2[LLM responde só com as linhas]
-    L2 --> R
-```
-
-### Como o uso de RAG é forçado
+## Como o uso de RAG é forçado
 
 O modelo nunca responde só com o próprio conhecimento:
 
 - Escopo: perguntas fora do domínio de vendas e pedidos para alterar a base ("apague", "atualize", "insira"...) são bloqueados antes de chamar o LLM (HTTP 400). O próprio LLM também pode marcar a pergunta como `FORA_DO_ESCOPO`.
 - Contexto obrigatório: a resposta só é gerada a partir das linhas retornadas pela consulta. Se a consulta não retorna dados, a API devolve uma resposta fixa, sem chamar o LLM.
 - Prompt restritivo: o prompt de resposta proíbe conhecimento externo, valores inventados, contas feitas pelo modelo (somas e médias que não vieram do banco) e símbolos de moeda que a base não informa.
-
-### Segurança do banco (defesa em camadas)
-
-1. Validação do SQL com sqlglot, que lê a árvore sintática da consulta (não usa regex):
-   - só uma instrução, do tipo `SELECT`/`WITH`/`UNION`;
-   - nenhum comando de escrita ou DDL em nenhum ponto da árvore, inclusive dentro de CTEs (`WITH x AS (DELETE ...)`), `SELECT INTO` e `FOR UPDATE`;
-   - todas as tabelas, inclusive após vírgula, em JOINs e em subconsultas, precisam estar em `sales`, `products` ou `customers` (CTEs declaradas na própria consulta são aceitas);
-   - sem acesso a `pg_catalog`, `information_schema` ou outros esquemas;
-   - sem funções `pg_*` ou que expõem o servidor (`version`, `current_setting`, `dblink`, ...);
-   - `LIMIT` obrigatório (adicionado se faltar).
-2. Usuário somente leitura (`db/02_readonly_user.sql`): a API conecta como `sales_reader`, que só tem `SELECT` nas três tabelas e `default_transaction_read_only = on`. Os testes de integração provam que ele não consegue escrever nem ler outras tabelas, mesmo tentando `SET TRANSACTION READ WRITE`.
-3. Transação `READ ONLY` com `statement_timeout`, e no máximo `MAX_ROWS_TO_LLM` linhas lidas.
-4. Erros internos não vazam: falhas inesperadas retornam `502` com mensagem genérica; o detalhe fica só no log.
-5. Container sem root: a imagem roda como `appuser`, com healthcheck.
-
-### Datas relativas
-
-Os dados de exemplo vão de janeiro a março de 2025. Usar a data de hoje faria "última semana" e "último mês" retornarem vazio. Por isso, a data de referência é, por padrão, a data da venda mais recente da base (2025-03-02). Para usar outra data, configure `REFERENCE_DATE` (ex.: `REFERENCE_DATE=2025-02-28`).
-
-- "Última semana" são os 7 dias e "último mês" os 30 dias anteriores à data de referência, a mesma regra do `/top-products`.
-- Esses intervalos são calculados em Python. Quando a pergunta cita um desses períodos, a expressão é trocada pelo intervalo exato na pergunta enviada ao LLM (a palavra "mês" some), para que ele não confunda "último mês" com o mês de calendário anterior.
-- Quando a pergunta cita um mês sem ano ("fevereiro"), o SQL filtra também pelo ano da data de referência.
-
-`/top-products` ordena por quantidade vendida e, em caso de empate, por faturamento (`?days=` ajusta a janela).
-
-### Desempenho e resiliência
-
-- Cache de respostas em memória por `ANSWER_CACHE_TTL` segundos (padrão 1 hora): a mesma pergunta, ignorando caixa, acentos e pontuação, volta em milissegundos.
-- Cache do esquema: DDL e linhas de exemplo são montados uma vez e reutilizados.
-- Timeout por chamada ao LLM (`LLM_TIMEOUT`): uma requisição nunca fica pendurada se o provedor travar.
-- Aquecimento do modelo: ao subir, a API pede ao Ollama para carregar o modelo em segundo plano e mantê-lo na memória (`OLLAMA_KEEP_ALIVE`), evitando que a primeira pergunta espere o carregamento.
-- Correção de SQL: se o SQL gerado falhar, o erro volta ao LLM para corrigir, até `SQL_MAX_RETRIES` vezes.
 
 ## Como rodar
 
@@ -195,11 +150,11 @@ curl -G "http://localhost:8000/sales-insights" --data-urlencode "question=Qual �
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q                                # unitários (SQLite em memória + LLM falso), sem Postgres nem Ollama
+pytest -q                                # 76 testes unitários (SQLite em memória + LLM falso)
 ruff check . && ruff format --check .    # lint e formatação (pip install ruff)
 ```
 
-Testes de integração com PostgreSQL (`tests/test_postgres.py`), contra um banco carregado com os dois scripts de `db/`:
+Os 18 testes de integração (`tests/test_postgres.py`) rodam contra um PostgreSQL carregado com os dois scripts de `db/` (com o compose no ar, `make test-postgres`):
 
 ```bash
 TEST_POSTGRES_URL=postgresql+psycopg2://sales_reader:sales_reader@localhost:5432/sales \
@@ -207,83 +162,22 @@ TEST_POSTGRES_ADMIN_URL=postgresql+psycopg2://sales:sales@localhost:5432/sales \
 pytest -q -m postgres
 ```
 
-São 94 testes ao todo:
-
-- Unitários (76):
-  - `/top-products`: ranking e validação de parâmetros;
-  - `/sales-insights`: resposta baseada em dados, resposta fixa sem dados, correção do SQL gerado (até 2 vezes, depois 502), SQL inseguro vindo do LLM e erro genérico quando o LLM cai;
-  - cache: pergunta repetida não chama o LLM, expiração, limite de itens e cache do esquema;
-  - `/health`: ok, degradado (LLM fora) e 503 (banco fora); middleware de `X-Request-ID`; timeout e aquecimento do LLM;
-  - guardrails da pergunta: prompt injection, pedidos de alteração, perguntas válidas aceitas e fora de escopo rejeitadas;
-  - guardrails do SQL: escrita, DDL, várias instruções, tabelas não permitidas (inclusive após vírgula e em subconsultas), catálogos do sistema, funções perigosas, `SELECT INTO`, CTE com `DELETE`, `FOR UPDATE`, e consultas válidas aceitas;
-  - períodos relativos e estrutura do conjunto de avaliação.
-- Integração com PostgreSQL (18): permissões do usuário somente leitura (escrita e outras tabelas negadas), transação `READ ONLY`, `statement_timeout`, limite de linhas, SQL específico do Postgres (`TO_CHAR`, `TIMESTAMP`, `EXTRACT`, CTE) com os valores esperados e a API ponta a ponta.
-
-CI (`.github/workflows/ci.yml`): a cada push roda lint, testes unitários, testes de integração com um serviço PostgreSQL 16 e o build da imagem Docker (conferindo que ela roda sem root).
+O CI (`.github/workflows/ci.yml`) roda lint, testes unitários, testes de integração com PostgreSQL 16 e o build da imagem Docker a cada push. O que cada teste cobre está em [docs/DETALHES.md](docs/DETALHES.md#testes).
 
 ## Avaliação do LLM
 
-Os testes acima usam um LLM falso. Para medir o LLM de verdade há um conjunto de 34 perguntas de referência em `eval/perguntas.json`, com os valores esperados calculados direto no `01_init.sql`, em dois grupos:
+Os testes usam um LLM falso. Para medir o LLM de verdade, `eval/perguntas.json` tem 34 perguntas com os valores esperados calculados no próprio script do banco: 14 usadas para calibrar o prompt e 20 inéditas, rodadas primeiro sem nenhum ajuste.
 
-- ajuste (14): perguntas usadas para calibrar o prompt durante o desenvolvimento;
-- inéditas (20): escritas depois e rodadas primeiro sem nenhum ajuste de prompt, para medir como o modelo se sai com perguntas que nunca viu (16 de dados e 4 que devem ser recusadas).
+| Llama 3.1 8B (Ollama, CPU) | Ajuste (14) | Inéditas (20) | Total |
+|---|---|---|---|
+| Primeira rodada com as inéditas | 14/14 | 18/20 | 32/34 |
+| Rodada final | 13/14 | 20/20 | 33/34 |
 
 ```bash
-python scripts/avaliar.py --url http://localhost:8000 --rodadas 3   # suba a API com ANSWER_CACHE_TTL=0
+python scripts/avaliar.py --url http://localhost:8000   # ou: make eval / testar-consistencia.ps1
 ```
 
-Também via `make eval-consistencia` (Linux/macOS) ou `testar-consistencia.ps1 -Rodadas 2` (Windows), que reconstroem a API com o cache desligado e mostram o placar por grupo.
-
-Resultados com Llama 3.1 8B (Ollama, CPU, cache desligado):
-
-| Rodada | Ajuste (14) | Inéditas (20) | Total |
-|---|---|---|---|
-| Primeira rodada com as inéditas, sem nenhum ajuste para elas | 14/14 | 18/20 | 32/34 |
-| Depois de duas regras gerais no prompt e da remoção de moeda em código | 13/14 | 20/20 | 33/34 |
-
-- Os dois erros da primeira rodada foram de interpretação: "fez mais compras" virou soma de unidades em vez de contagem de vendas, e "produto mais caro" veio sem o preço. Viraram regras gerais no prompt (contagem x unidades; incluir no SELECT a coluna usada para ordenar), não respostas específicas.
-- O erro da rodada final mudou de pergunta: o top 3 do último mês agrupou por produto e data. Com um modelo de 8B, mudar o prompt para uma pergunta às vezes altera a interpretação de outra; por isso o que dava para garantir foi para código (períodos relativos, moeda, pedidos de alteração) e não regrediu mais.
-- Respostas idênticas entre rodadas com o mesmo prompt (temperatura 0).
-- Tempo por pergunta com LLM: mediana de ~25 s (de 10 a 75 s). A primeira pergunta logo após subir a API espera o modelo carregar (até alguns minutos em CPU).
-- Pergunta repetida: ~0,1 s (cache).
-- Pedidos para alterar a base foram recusados em todas as rodadas; o banco continuou com as 33 vendas.
-
-## Decisões técnicas
-
-- Text-to-SQL em vez de embeddings: os dados são tabulares e as perguntas são agregações (somas, rankings, períodos). Um banco vetorial recuperaria trechos, mas não calcularia totais; gerar SQL deixa o banco fazer as contas, com resultado exato e auditável.
-- O LLM não faz contas: datas relativas são calculadas em Python e o prompt proíbe somas e médias que não vieram do banco. Os erros mais comuns de modelos pequenos são aritméticos.
-- Validação por árvore sintática: regex não enxerga tabelas após vírgula, subconsultas ou CTEs com `DELETE`; o sqlglot lê a consulta como o banco leria.
-- Defesa em profundidade: mesmo que a validação falhasse, o usuário `sales_reader` e a transação `READ ONLY` impedem qualquer escrita no próprio banco.
-- Data de referência na última venda: com dados de 2025, usar a data de hoje deixaria "última semana" vazia; `REFERENCE_DATE` permite fixar outra data.
-- Llama 3.1 via Ollama como padrão: gratuito e local (nenhum dado sai da máquina); trocar para OpenAI é só uma variável de ambiente.
-
-## Limitações conhecidas
-
-- Modelo pequeno: o Llama 3.1 8B acerta a grande maioria das perguntas (33/34 na avaliação), mas pode interpretar uma pergunta de forma inesperada, como agrupar por uma coluna a mais. A resposta sempre traz o SQL e as linhas para conferência; um modelo maior (ex.: `gpt-4o-mini`) interpreta com mais segurança.
-- Heurísticas: o filtro de escopo usa uma lista de termos do domínio, e a troca de "último mês" por datas usa padrões de texto. O LLM é a segunda barreira (`FORA_DO_ESCOPO`), e a validação do SQL é a terceira.
-- Latência em CPU: de 20 a 60 s por pergunta nova; GPU ou um provedor externo reduzem para poucos segundos.
-- Cache local: fica na memória de cada instância da API.
-
-## Configuração
-
-| Variável | Padrão | Descrição |
-|---|---|---|
-| `DATABASE_URL` | `postgresql+psycopg2://sales:sales@localhost:5432/sales` | Conexão com o banco (no Docker: usuário `sales_reader`) |
-| `LLM_PROVIDER` | `ollama` | `ollama` ou `openai` |
-| `LLM_MODEL` | `llama3.1` | Modelo (ex.: `gpt-4o-mini` na OpenAI) |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Endereço do Ollama |
-| `OPENAI_API_KEY` | — | Chave da OpenAI |
-| `LLM_TIMEOUT` | `300` | Tempo máximo (s) de cada chamada ao LLM |
-| `LLM_WARMUP` | `true` | Pré-carrega o modelo do Ollama ao subir |
-| `OLLAMA_KEEP_ALIVE` | `30m` | Tempo que o modelo fica carregado na memória |
-| `LLM_HEALTH_TIMEOUT` | `3` | Tempo máximo (s) do `/health` para checar o LLM |
-| `REFERENCE_DATE` | última venda | Data usada como "hoje" |
-| `MAX_QUESTION_LENGTH` | `300` | Tamanho máximo da pergunta |
-| `MAX_ROWS_TO_LLM` | `50` | Linhas máximas lidas e enviadas ao LLM |
-| `SQL_TIMEOUT_MS` | `5000` | `statement_timeout` das consultas |
-| `SQL_MAX_RETRIES` | `2` | Correções de SQL pelo LLM |
-| `ANSWER_CACHE_TTL` | `3600` | Duração do cache de respostas (s); `0` desativa |
-| `ANSWER_CACHE_SIZE` | `256` | Número máximo de respostas em cache |
+Os erros, o que foi ajustado e os tempos medidos estão em [docs/DETALHES.md](docs/DETALHES.md#avaliação-do-llm).
 
 ## Estrutura
 
@@ -310,15 +204,8 @@ scripts/avaliar.py        # avaliação automática do LLM (qualquer sistema)
 requirements.txt          # dependências de produção
 requirements-dev.txt      # + pytest e httpx
 pyproject.toml            # configuração do pytest e do ruff
+docs/DETALHES.md          # arquitetura, segurança, decisões, avaliação e configuração
 testar-docker.ps1         # teste ponta a ponta no Docker (Windows)
 testar-consistencia.ps1   # avaliação do LLM no Docker com placar (Windows)
 Makefile                  # atalhos para Linux/macOS (make help)
 ```
-
-## Melhorias possíveis em produção
-
-- Autenticação e rate limit por cliente.
-- Cache compartilhado (Redis) quando houver mais de uma instância da API.
-- Senhas do banco em secrets, em vez de valores fixos no `docker-compose.yml`.
-- Observabilidade das chamadas ao LLM (Langfuse ou LangSmith) e a avaliação de `eval/` rodando periodicamente.
-- GPU para o Ollama ou um modelo maior, para reduzir o tempo de resposta.
