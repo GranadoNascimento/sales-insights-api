@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.pytest_cache/
+.ruff_cache/
+resultado-docker.txt
+resultado-consistencia.txt
+resultado-avaliacao.json
