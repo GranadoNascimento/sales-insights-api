@@ -1,3 +1,5 @@
+"""Criação do modelo (Ollama ou OpenAI), checagem para o /health e pré-carregamento."""
+
 import json
 import logging
 import os
@@ -15,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 @lru_cache
 def get_llm() -> BaseChatModel:
+    """Modelo configurado, com temperatura 0 e timeout por chamada."""
     if settings.llm_provider == "openai":
         from langchain_openai import ChatOpenAI
 

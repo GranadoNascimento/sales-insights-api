@@ -1,3 +1,5 @@
+"""Cache em memória com expiração, usado nas respostas do /sales-insights."""
+
 import time
 from collections import OrderedDict
 from collections.abc import Hashable
@@ -6,6 +8,8 @@ from typing import Any
 
 
 class TTLCache:
+    """Guarda até maxsize itens por ttl segundos; seguro entre threads."""
+
     def __init__(self, maxsize: int, ttl: float):
         self.maxsize = maxsize
         self.ttl = ttl

@@ -1,3 +1,5 @@
+"""Validação da pergunta e do SQL gerado pelo LLM (limitações que forçam o uso de RAG)."""
+
 import re
 import unicodedata
 
@@ -151,12 +153,14 @@ class InvalidSQLError(ValueError):
 
 
 def normalize_text(text: str) -> str:
+    """Minúsculas, sem acento e com espaços simples, para comparar texto."""
     text = unicodedata.normalize("NFKD", (text or "").lower())
     text = "".join(c for c in text if not unicodedata.combining(c))
     return re.sub(r"\s+", " ", text).strip()
 
 
 def validate_question(question: str) -> str:
+    """Barra pergunta vazia, longa, com prompt injection, pedido de alteração ou fora do escopo."""
     question = (question or "").strip()
     if len(question) < 3:
         raise GuardrailError("A pergunta está vazia ou é curta demais.")
@@ -174,6 +178,7 @@ def validate_question(question: str) -> str:
 
 
 def clean_sql(raw: str) -> str:
+    """Tira o markdown e o texto em volta do SQL que o LLM devolve."""
     sql = re.sub(r"```(?:sql)?", "", raw, flags=re.IGNORECASE).strip()
     match = re.search(r"\b(with|select)\b", sql, re.IGNORECASE)
     if match:

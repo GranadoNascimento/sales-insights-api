@@ -1,3 +1,5 @@
+"""Modelos do SQLAlchemy para as tabelas do script do banco."""
+
 from datetime import datetime
 from decimal import Decimal
 

@@ -1,3 +1,5 @@
+"""Endpoints da API."""
+
 import logging
 import re
 import time

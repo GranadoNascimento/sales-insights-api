@@ -1,3 +1,5 @@
+"""Fluxo do /sales-insights: pergunta -> SQL gerado pelo LLM -> consulta -> resposta com base nas linhas."""
+
 import json
 import logging
 import re
@@ -170,6 +172,7 @@ def _json_default(value):
 
 
 def _run_readonly(db: Session, sql: str) -> list[dict]:
+    """Executa em transação READ ONLY com timeout e lê no máximo MAX_ROWS_TO_LLM linhas."""
     conn = db.connection()
     if conn.dialect.name == "postgresql":
         conn.execute(text("SET TRANSACTION READ ONLY"))
@@ -196,6 +199,7 @@ def _build_schema_info(db: Session, sample_rows: int) -> str:
 
 
 def get_schema_info(db: Session, sample_rows: int = 2) -> str:
+    """DDL das tabelas + linhas de exemplo para o prompt, montado uma vez por engine."""
     bind = db.get_bind()
     key = (id(bind), str(bind.url))
     with _schema_lock:
@@ -209,6 +213,8 @@ def get_schema_info(db: Session, sample_rows: int = 2) -> str:
 
 
 class SalesInsightsService:
+    """Responde perguntas sobre vendas usando só os dados do banco."""
+
     def __init__(self, llm: BaseChatModel, db: Session):
         self.db = db
         to_sql = StrOutputParser() | RunnableLambda(clean_sql)
@@ -217,6 +223,7 @@ class SalesInsightsService:
         self.answer_chain = ANSWER_PROMPT | llm | StrOutputParser()
 
     def answer(self, question: str) -> dict:
+        """Valida a pergunta, devolve do cache se puder e, senão, gera a resposta."""
         question = validate_question(question)
         reference_date = get_reference_date(self.db).isoformat(sep=" ")
 
@@ -235,6 +242,7 @@ class SalesInsightsService:
         return {**result, "cached": False}
 
     def _answer_uncached(self, question: str, reference_date: str) -> dict:
+        """Gera o SQL, executa (com correções se falhar) e monta a resposta a partir das linhas."""
         dialect_name = self.db.get_bind().dialect.name
         sqlglot_dialect = SQLGLOT_DIALECTS.get(dialect_name)
         periods = relative_periods(reference_date)

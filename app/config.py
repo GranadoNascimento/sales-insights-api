@@ -1,3 +1,5 @@
+"""Configurações lidas de variáveis de ambiente (ou do arquivo .env)."""
+
 import os
 from dataclasses import dataclass, field
 from datetime import datetime

@@ -1,3 +1,5 @@
+"""Consultas fixas, sem LLM: top produtos e data de referência."""
+
 from datetime import datetime, timedelta
 
 from sqlalchemy import desc, func, select
@@ -16,6 +18,7 @@ def get_reference_date(db: Session) -> datetime:
 
 
 def get_top_products(db: Session, days: int = 30, limit: int = 5) -> dict:
+    """Produtos mais vendidos (por quantidade) nos `days` dias até a data de referência."""
     end = get_reference_date(db)
     start = end - timedelta(days=days)
 
